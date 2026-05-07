@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime artifacts
+runs/
+samples/
+*.log
+*.pdf
+*.png
+*.ppm
+*.html
+
+# Office temporary files
+~$*.doc
+~$*.docx
+.~lock.*#
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

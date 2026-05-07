@@ -1,0 +1,64 @@
+{
+  "name": "sdju-undergraduate-thesis",
+  "template_candidates": [
+    "samples/templates/论文格式.doc",
+    "samples/templates/论文格式.docx"
+  ],
+  "renderer": {
+    "dpi": 120,
+    "near_blank_ink_ratio": 0.006,
+    "blank_ink_ratio": 0.001
+  },
+  "expected_sections": [
+    "毕业设计（论文）学术诚信声明",
+    "毕业设计（论文）AI 使用情况声明",
+    "毕业设计（论文）版权使用授权书",
+    "摘 要",
+    "Abstract",
+    "目 录",
+    "1 绪论",
+    "2",
+    "3",
+    "4",
+    "5 总结与展望",
+    "参考文献",
+    "致谢"
+  ],
+  "main_heading_patterns": [
+    "^1\\s+绪论",
+    "^2\\s+.+",
+    "^3\\s+.+",
+    "^4\\s+.+",
+    "^5\\s+总结与展望",
+    "^参考文献"
+  ],
+  "content_quality": {
+    "min_reference_count": 10,
+    "min_foreign_reference_count": 1,
+    "min_chinese_abstract_chars": 250,
+    "max_chinese_abstract_chars": 600,
+    "min_body_chinese_chars": 7000,
+    "recommended_body_chinese_chars": 10000,
+    "min_keywords": 3,
+    "max_keywords": 5,
+    "required_engineering_topics": [
+      "需求分析",
+      "系统设计",
+      "实现",
+      "测试",
+      "总结"
+    ],
+    "forbidden_markers": [
+      "TODO",
+      "待补充",
+      "这里填写",
+      "参考来源？",
+      "Error: Reference source not found"
+    ]
+  },
+  "visual": {
+    "detect_near_blank_pages": true,
+    "detect_heading_page_map": true,
+    "detect_caption_orphans": true
+  }
+}

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thesis-agent"
+version = "0.1.0"
+description = "Agent workflow for formatting and reviewing undergraduate thesis drafts against a Word template."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=10",
+]
+
+[project.scripts]
+thesis-agent = "thesis_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
