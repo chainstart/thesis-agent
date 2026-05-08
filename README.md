@@ -14,18 +14,9 @@
 
 ## 样本
 
-公开仓库不提交真实学生论文、学校模板原件和运行产物。完整验收需要在本机私有环境中自行准备以下材料：
+公开仓库不提交真实学生论文、学校模板原件和运行产物。完整验收需要在本机私有环境中自行准备模板与论文样本。
 
-- `samples/templates/论文格式.doc`
-- `samples/templates/论文格式.docx`
-- `samples/templates/附件15 学士学位论文封面.docx`
-- `samples/drafts/物联网2212-杨钰婷-毕业论文初稿.docx`
-- `samples/drafts/物联网2212-蔡宇璐-冷链物流温控追踪系统-初稿.docx`
-- `samples/drafts/毕业论文.docx`
-- `samples/drafts/论文2.doc`
-- `samples/drafts/论文初.doc`
-
-这些文件包含学生论文内容，只适合在本机私有环境中测试，因此 `samples/` 已加入 `.gitignore`。公开克隆中没有 `samples/` 时，样本依赖的 pytest 用例会自动跳过；需要完整验收时，把私有样本复制到同名路径后再运行测试。
+这些文件包含学生论文内容，只适合在本机私有环境中测试，因此 `samples/` 已加入 `.gitignore`。公开克隆中没有 `samples/` 时，样本依赖的 pytest 用例会自动跳过；需要完整验收时，把私有样本复制到对应路径后再运行测试。
 
 ## 环境
 
