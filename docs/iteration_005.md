@@ -31,8 +31,8 @@ Commands:
 ```bash
 PYTHONPATH=src python3 -m pytest -q
 PYTHONPATH=src python3 -m thesis_agent batch-process \
-  --template samples/templates/论文格式.doc \
-  --inputs samples/drafts \
+  --template /path/to/private-format-template.doc \
+  --inputs /path/to/private-drafts \
   --out runs/acceptance
 ```
 
@@ -40,11 +40,11 @@ Results:
 
 | Draft | Gate | Score | Blockers |
 | --- | --- | ---: | --- |
-| 毕业论文.docx | PASS | 96 | 0 |
-| 物联网2212-杨钰婷-毕业论文初稿.docx | PASS | 96 | 0 |
-| 物联网2212-蔡宇璐-冷链物流温控追踪系统-初稿.docx | PASS | 96 | 0 |
-| 论文2.doc | PASS | 96 | 0 |
-| 论文初.doc | PASS | 96 | 0 |
+| 私有样本 A | PASS | 96 | 0 |
+| 私有样本 B | PASS | 96 | 0 |
+| 私有样本 C | PASS | 96 | 0 |
+| 私有样本 D | PASS | 96 | 0 |
+| 私有样本 E | PASS | 96 | 0 |
 
 The full generated outputs are under `runs/acceptance/`. Each processed thesis includes `final.docx`, the audit report, content improvement plan, process report, and VLM-ready visual review package.
 

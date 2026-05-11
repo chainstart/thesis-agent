@@ -33,6 +33,7 @@ class RebuildReport:
     body_elements: int = 0
     reference_elements: int = 0
     acknowledgement_elements: int = 0
+    appendix_elements: int = 0
     imported_relationships: int = 0
     imported_parts: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -49,6 +50,7 @@ class ExtractedContent:
     body: list[ET.Element]
     references: list[ET.Element]
     acknowledgements: list[ET.Element]
+    appendices: list[ET.Element]
     toc_titles: list[str]
     warnings: list[str] = field(default_factory=list)
 
@@ -97,6 +99,7 @@ def rebuild_thesis_docx(template_path: Path, source_docx: Path, output_path: Pat
         source_owned_elements.extend(extracted.body)
         source_owned_elements.extend(extracted.references)
         source_owned_elements.extend(extracted.acknowledgements)
+        source_owned_elements.extend(extracted.appendices)
 
         import_result = _import_source_relationships(
             elements=source_owned_elements,
@@ -128,6 +131,8 @@ def rebuild_thesis_docx(template_path: Path, source_docx: Path, output_path: Pat
                 new_elements.append(_page_break_paragraph())
                 new_elements.append(_main_heading_paragraph("致  谢"))
             new_elements.extend(extracted.acknowledgements)
+        if extracted.appendices:
+            new_elements.extend(extracted.appendices)
         if template_final_section is not None:
             new_elements.append(copy.deepcopy(template_final_section))
 
@@ -178,6 +183,7 @@ def rebuild_thesis_docx(template_path: Path, source_docx: Path, output_path: Pat
         body_elements=len(extracted.body),
         reference_elements=len(extracted.references),
         acknowledgement_elements=len(extracted.acknowledgements),
+        appendix_elements=len(extracted.appendices),
         imported_relationships=import_result.relationships,
         imported_parts=sorted(import_result.parts),
         warnings=warnings,
@@ -185,10 +191,12 @@ def rebuild_thesis_docx(template_path: Path, source_docx: Path, output_path: Pat
 
 
 def _resolve_template_docx(template_path: Path) -> Path | None:
+    if template_path.name.startswith("~$"):
+        return None
     if template_path.suffix.lower() == ".docx" and template_path.exists():
         return template_path
     candidate = template_path.with_suffix(".docx")
-    if candidate.exists():
+    if not candidate.name.startswith("~$") and candidate.exists():
         return candidate
     return None
 
@@ -203,6 +211,7 @@ def _extract_source_content(source_body: ET.Element) -> ExtractedContent:
     first_body_idx = _first_index(paragraphs, _is_first_body_heading)
     reference_idx = _first_index(paragraphs, lambda text: _compact(text) == "参考文献")
     ack_idx = _first_index(paragraphs, lambda text: _compact(text) in {"致谢", "致謝"})
+    appendix_idx = _first_index(paragraphs, lambda text: _compact(text).startswith("附录") or _compact(text).startswith("附件"))
 
     content_start_candidates = [idx for idx in [first_decl, abstract_idx, toc_idx, first_body_idx] if idx is not None]
     content_start = min(content_start_candidates) if content_start_candidates else 0
@@ -214,21 +223,27 @@ def _extract_source_content(source_body: ET.Element) -> ExtractedContent:
     abstract = children[abstract_start:abstract_end] if abstract_start is not None else []
 
     body_start = first_body_idx
-    body_end_candidates = [idx for idx in [reference_idx, ack_idx] if idx is not None and body_start is not None and idx > body_start]
+    body_end_candidates = [idx for idx in [reference_idx, ack_idx, appendix_idx] if idx is not None and body_start is not None and idx > body_start]
     body_end = min(body_end_candidates) if body_end_candidates else len(children)
     body = children[body_start:body_end] if body_start is not None else []
 
     references: list[ET.Element] = []
     if reference_idx is not None:
-        ref_end = ack_idx if ack_idx is not None and ack_idx > reference_idx else len(children)
+        ref_end_candidates = [idx for idx in [ack_idx, appendix_idx] if idx is not None and idx > reference_idx]
+        ref_end = min(ref_end_candidates) if ref_end_candidates else len(children)
         references = children[reference_idx:ref_end]
 
     acknowledgements: list[ET.Element] = []
     if ack_idx is not None:
-        acknowledgements = children[ack_idx:len(children)]
+        ack_end = appendix_idx if appendix_idx is not None and appendix_idx > ack_idx else len(children)
+        acknowledgements = children[ack_idx:ack_end]
+
+    appendices: list[ET.Element] = []
+    if appendix_idx is not None:
+        appendices = children[appendix_idx:len(children)]
 
     title = _infer_title(cover, children)
-    toc_titles = _toc_titles_from_body(body, references, acknowledgements)
+    toc_titles = _toc_titles_from_body(body, references, acknowledgements, appendices)
     warnings: list[str] = []
     if not abstract:
         warnings.append("未从源文档识别到摘要区域，重建稿将缺少源摘要。")
@@ -243,6 +258,7 @@ def _extract_source_content(source_body: ET.Element) -> ExtractedContent:
         body=body,
         references=references,
         acknowledgements=acknowledgements,
+        appendices=appendices,
         toc_titles=toc_titles,
         warnings=warnings,
     )
@@ -302,11 +318,16 @@ def _looks_like_title(text: str) -> bool:
         return False
     if "：" in compact or ":" in compact:
         return False
-    banned = ["上海电机学院", "学生姓名", "学生学号", "指导教师", "专业", "学院", "摘要", "目录", "声明", "授权书", "关键词", "关键字", "KeyWords", "Keywords"]
+    banned = ["学校名称", "学生姓名", "学生学号", "指导教师", "专业", "学院", "大学", "摘要", "目录", "声明", "授权书", "关键词", "关键字", "KeyWords", "Keywords"]
     return bool(re.search(r"[\u4e00-\u9fff]", compact)) and not any(item in compact for item in banned)
 
 
-def _toc_titles_from_body(body: list[ET.Element], references: list[ET.Element], acknowledgements: list[ET.Element]) -> list[str]:
+def _toc_titles_from_body(
+    body: list[ET.Element],
+    references: list[ET.Element],
+    acknowledgements: list[ET.Element],
+    appendices: list[ET.Element] | None = None,
+) -> list[str]:
     titles: list[str] = []
     seen: set[str] = set()
     for element in body:
@@ -322,6 +343,8 @@ def _toc_titles_from_body(body: list[ET.Element], references: list[ET.Element], 
         titles.append("参考文献")
     if acknowledgements:
         titles.append("致谢")
+    if appendices:
+        titles.append("附录")
     return titles
 
 
@@ -433,6 +456,8 @@ def _starts_with_heading(elements: list[ET.Element], heading: str) -> bool:
 
 def _sanitize_imported_body_element(element: ET.Element) -> ET.Element:
     cleaned = copy.deepcopy(element)
+    for table in cleaned.iter(_w("tbl")):
+        _normalize_imported_table(table)
     for paragraph in cleaned.iter(_w("p")):
         for attr in list(paragraph.attrib):
             if attr.endswith("paraId") or attr.endswith("textId") or "rsid" in attr:
@@ -451,6 +476,75 @@ def _sanitize_imported_body_element(element: ET.Element) -> ET.Element:
         if parent is not None:
             parent.remove(sect)
     return cleaned
+
+
+def _normalize_imported_table(table: ET.Element) -> None:
+    tbl_pr = table.find("w:tblPr", NS)
+    if tbl_pr is None:
+        tbl_pr = ET.Element(_w("tblPr"))
+        table.insert(0, tbl_pr)
+    for name in ("tblStyle", "tblLayout", "tblLook"):
+        for node in list(tbl_pr.findall(f"w:{name}", NS)):
+            tbl_pr.remove(node)
+    jc = tbl_pr.find("w:jc", NS)
+    if jc is None:
+        jc = ET.SubElement(tbl_pr, _w("jc"))
+    jc.set(_w("val"), "center")
+    borders = tbl_pr.find("w:tblBorders", NS)
+    if borders is None:
+        borders = ET.SubElement(tbl_pr, _w("tblBorders"))
+    for name, value in (("top", "single"), ("bottom", "single"), ("left", "nil"), ("right", "nil"), ("insideH", "nil"), ("insideV", "nil")):
+        border = borders.find(f"w:{name}", NS)
+        if border is None:
+            border = ET.SubElement(borders, _w(name))
+        border.set(_w("val"), value)
+        if value == "single":
+            border.set(_w("sz"), "4")
+            border.set(_w("space"), "0")
+            border.set(_w("color"), "000000")
+    for paragraph in table.iter(_w("p")):
+        ppr = paragraph.find("w:pPr", NS)
+        if ppr is None:
+            ppr = ET.Element(_w("pPr"))
+            paragraph.insert(0, ppr)
+        for name in ("pStyle", "numPr", "ind", "tabs", "pageBreakBefore"):
+            for node in list(ppr.findall(f"w:{name}", NS)):
+                ppr.remove(node)
+        spacing = ppr.find("w:spacing", NS)
+        if spacing is None:
+            spacing = ET.SubElement(ppr, _w("spacing"))
+        spacing.set(_w("before"), "0")
+        spacing.set(_w("after"), "0")
+        spacing.set(_w("line"), "240")
+        spacing.set(_w("lineRule"), "auto")
+        jc = ppr.find("w:jc", NS)
+        if jc is None:
+            jc = ET.SubElement(ppr, _w("jc"))
+        jc.set(_w("val"), "center")
+        for run in paragraph.findall("w:r", NS):
+            _normalize_imported_table_run(run)
+
+
+def _normalize_imported_table_run(run: ET.Element) -> None:
+    rpr = run.find("w:rPr", NS)
+    if rpr is None:
+        rpr = ET.Element(_w("rPr"))
+        run.insert(0, rpr)
+    for name in ("rStyle", "color", "u", "highlight"):
+        for node in list(rpr.findall(f"w:{name}", NS)):
+            rpr.remove(node)
+    rfonts = rpr.find("w:rFonts", NS)
+    if rfonts is None:
+        rfonts = ET.Element(_w("rFonts"))
+        rpr.insert(0, rfonts)
+    rfonts.set(_w("eastAsia"), "宋体")
+    rfonts.set(_w("ascii"), "Times New Roman")
+    rfonts.set(_w("hAnsi"), "Times New Roman")
+    for name in ("sz", "szCs"):
+        node = rpr.find(f"w:{name}", NS)
+        if node is None:
+            node = ET.SubElement(rpr, _w(name))
+        node.set(_w("val"), "24")
 
 
 def _parent_map(root: ET.Element) -> dict[ET.Element, ET.Element]:

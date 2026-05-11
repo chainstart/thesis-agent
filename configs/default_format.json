@@ -1,8 +1,8 @@
 {
-  "name": "sdju-undergraduate-thesis",
+  "name": "default-undergraduate-thesis",
   "template_candidates": [
-    "samples/templates/论文格式.doc",
-    "samples/templates/论文格式.docx"
+    "/path/to/private-format-template.doc",
+    "/path/to/private-format-template.docx"
   ],
   "renderer": {
     "dpi": 120,

@@ -5,23 +5,23 @@
 ## 新增能力
 
 - `fix-format --template` 现在会使用模板 `.docx`，从模板中提取前置声明页并插入目标论文。
-- 传入 `论文格式.doc` 时，会自动寻找同目录的 `论文格式.docx` 作为 OOXML 前置页来源。
+- 传入学校格式模板 `.doc` 时，会自动寻找同目录的对应 `.docx` 作为 OOXML 前置页来源。
 - 前置页移植会处理 `document.xml.rels` 和 `[Content_Types].xml`，避免生成 LibreOffice 无法加载的 DOCX。
 - 前置页不再复制模板旧页眉页脚，避免出现模板论文题目“二甲醚……”。
 - 修复 `keepNext/keepLines` 的 OpenXML 插入顺序，减少 schema 校验噪声。
 - 审计新增目录标题拆页检测：如果“目”和“录”分裂在相邻页面，会列为 `Split TOC title pages`。
 - 空白页/近空白页检测忽略声明页中的签名、日期、保密勾选等低内容页面，减少误报。
 
-## 杨钰婷样本测试
+## 私有样本测试
 
 命令：
 
 ```bash
 PYTHONPATH=src python3 -m thesis_agent fix-format \
-  --target samples/drafts/物联网2212-杨钰婷-毕业论文初稿.docx \
-  --output runs/fixes/yang-frontmatter-fixed.docx \
-  --template samples/templates/论文格式.doc \
-  --audit-out runs/fixes/yang-frontmatter-audit
+  --target /path/to/private-student-draft.docx \
+  --output runs/fixes/private-frontmatter-fixed.docx \
+  --template /path/to/private-format-template.doc \
+  --audit-out runs/fixes/private-frontmatter-audit
 ```
 
 修复动作：
@@ -46,7 +46,7 @@ PYTHONPATH=src python3 -m thesis_agent fix-format \
 
 ## 视觉审阅结论
 
-视觉包：`runs/fixes/yang-frontmatter-vision-pack/`
+视觉包：`runs/fixes/private-frontmatter-vision-pack/`
 
 当前修复稿相较上一轮有明显进步，但仍不能作为最终稿：
 

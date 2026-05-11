@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-
-
-DEFAULT_OFFICECLI = Path("/home/biostar/work/external/bin/officecli")
 
 
 @dataclass(frozen=True)
@@ -19,9 +17,8 @@ class Toolchain:
 
     @classmethod
     def discover(cls) -> "Toolchain":
-        officecli = shutil.which("officecli")
-        if officecli is None and DEFAULT_OFFICECLI.exists():
-            officecli = str(DEFAULT_OFFICECLI)
+        configured_officecli = os.environ.get("THESIS_AGENT_OFFICECLI")
+        officecli = configured_officecli if configured_officecli and Path(configured_officecli).exists() else shutil.which("officecli")
         return cls(
             soffice=shutil.which("soffice-headless") or shutil.which("soffice") or shutil.which("libreoffice"),
             pdftoppm=shutil.which("pdftoppm"),

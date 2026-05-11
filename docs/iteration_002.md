@@ -15,16 +15,16 @@
 - 优化近空白页判断，避免把目录尾页误报成空白页。
 - 如果存在疑似题注孤页，审计状态保持 `needs_fix`。
 
-## 杨钰婷样本修复验证
+## 私有样本 B 修复验证
 
 命令：
 
 ```bash
 PYTHONPATH=src python3 -m thesis_agent fix-format \
-  --target samples/drafts/物联网2212-杨钰婷-毕业论文初稿.docx \
-  --output runs/fixes/yang-fixed.docx \
-  --template samples/templates/论文格式.doc \
-  --audit-out runs/fixes/yang-fixed-audit
+  --target /path/to/private-student-draft.docx \
+  --output runs/fixes/private-sample-fixed.docx \
+  --template /path/to/private-format-template.doc \
+  --audit-out runs/fixes/private-sample-audit
 ```
 
 修复动作：
@@ -49,9 +49,9 @@ PYTHONPATH=src python3 -m thesis_agent fix-format \
 
 | 样本 | 页数变化 | 空白页变化 | 长空段变化 | 正文页码从 1 开始 | 仍需处理 |
 | --- | ---: | --- | --- | --- | --- |
-| 毕业论文.docx | 57 -> 55 | 无 -> 无 | 5 组 -> 无 | 是 | 题注、关键词、测试方法 |
-| 物联网2212-杨钰婷-毕业论文初稿.docx | 47 -> 45 | 46,47 -> 无 | 1 组 -> 无 | 是 | 题注、测试章节 |
-| 物联网2212-蔡宇璐-冷链物流温控追踪系统-初稿.docx | 41 -> 41 | 无 -> 无 | 2 组 -> 无 | 是 | 题注、关键词、测试方法 |
+| 私有样本 A | 57 -> 55 | 无 -> 无 | 5 组 -> 无 | 是 | 题注、关键词、测试方法 |
+| 私有样本 B | 47 -> 45 | 46,47 -> 无 | 1 组 -> 无 | 是 | 题注、测试章节 |
+| 私有样本 C | 41 -> 41 | 无 -> 无 | 2 组 -> 无 | 是 | 题注、关键词、测试方法 |
 
 ## 下一步
 

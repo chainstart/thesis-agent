@@ -369,6 +369,8 @@ def _detect_figure_readability_warnings(caption_boxes: dict[int, list[CaptionBox
             continue
         scale = image.height / max(boxes[0].page_height, 1)
         for box in boxes:
+            if _caption_allows_small_photo_detail(box.text):
+                continue
             caption_top = int(box.y_min * scale)
             crop_top = max(0, caption_top - int(210 * scale))
             crop_bottom = max(crop_top + 1, caption_top - int(8 * scale))
@@ -422,6 +424,13 @@ def _small_text_warning_for_crop(image, page: int, caption: str) -> str | None:
     if median_height <= 7:
         return f"page {page}: {caption} 上方图形疑似存在过小文字，建议放大或重绘"
     return None
+
+
+def _caption_allows_small_photo_detail(caption: str) -> bool:
+    compact = re.sub(r"\s+", "", caption)
+    if any(token in compact for token in ("需求图", "流程图", "架构图", "框图", "原理图", "电路", "配置", "界面", "网页", "代码", "公式")):
+        return False
+    return any(token in compact for token in ("传感器", "成品图", "实物", "模块图"))
 
 
 def _detect_caption_orphans(
@@ -540,6 +549,8 @@ def _meaningful_line_count(text: str) -> int:
 
 def _is_expected_sparse_page(text: str, next_text: str = "") -> bool:
     compact = re.sub(r"\s+", "", text)
+    if "注：本任务书由上海电机学院教务处印制" in compact:
+        return True
     if any(marker in compact for marker in ["作者签名", "指导教师签名", "日期", "保密□", "不保密□"]):
         return True
     if _meaningful_line_count(text) == 1 and re.search(r"[\u4e00-\u9fff]", text):

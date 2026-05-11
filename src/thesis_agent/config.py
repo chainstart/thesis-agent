@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "sdju_format.json"
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "default_format.json"
 
 
 @dataclass(frozen=True)

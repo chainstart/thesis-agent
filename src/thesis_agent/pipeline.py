@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
 from .content_review import review_content
+from .document_profile import THESIS, build_document_profile, config_for_document_kind
+from .document_requirements import inspect_document_requirements
 from .docx_inspect import inspect_docx
+from .metadata_store import extract_document_metadata
 from .pdf_inspect import extract_text
 from .render import render_document
 from .tools import Toolchain
@@ -55,10 +58,15 @@ def run_audit(template: Path, target: Path, out_dir: Path, config: AgentConfig, 
 
     template_visual = inspect_visual(rendered_template.pdf, rendered_template.pages, toolchain, config)
     target_visual = inspect_visual(rendered_target.pdf, rendered_target.pages, toolchain, config)
-    docx = inspect_docx(target_input)
+    raw_docx = inspect_docx(target_input)
     pdf_text = extract_text(rendered_target.pdf, toolchain)
-    target_text = docx.text if docx.supported and docx.text.strip() else pdf_text
-    content = review_content(target_text, config)
+    target_text = raw_docx.text if raw_docx.supported and raw_docx.text.strip() else pdf_text
+    document_profile = build_document_profile(target, template, target_text)
+    docx = _docx_checks_for_document_kind(raw_docx, document_profile.kind)
+    document_config = config_for_document_kind(config, document_profile.kind)
+    content = review_content(target_text, document_config)
+    metadata = extract_document_metadata(target, target_text)
+    requirements = inspect_document_requirements(target_input, document_profile.kind, metadata)
 
     result: dict[str, Any] = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -74,9 +82,11 @@ def run_audit(template: Path, target: Path, out_dir: Path, config: AgentConfig, 
         },
         "template_visual": template_visual,
         "target_visual": target_visual,
+        "document_profile": document_profile,
         "docx": docx,
         "content_review": content,
-        "status": _audit_status(target_visual, docx, content),
+        "document_requirements": requirements,
+        "status": _audit_status(target_visual, docx, content, requirements),
     }
 
     (out_dir / "report.json").write_text(
@@ -87,7 +97,7 @@ def run_audit(template: Path, target: Path, out_dir: Path, config: AgentConfig, 
     return result
 
 
-def _audit_status(target_visual: Any, docx: Any, content: Any) -> str:
+def _audit_status(target_visual: Any, docx: Any, content: Any, requirements: Any | None = None) -> str:
     if target_visual.blank_pages or target_visual.near_blank_pages:
         return "needs_fix"
     if target_visual.broken_reference_pages:
@@ -103,6 +113,8 @@ def _audit_status(target_visual: Any, docx: Any, content: Any) -> str:
     if getattr(target_visual, "header_page_number_alignment_errors", []):
         return "needs_fix"
     if target_visual.caption_orphan_pages:
+        return "needs_fix"
+    if getattr(target_visual, "figure_readability_warnings", []):
         return "needs_fix"
     if docx.supported and docx.broken_references:
         return "needs_fix"
@@ -128,9 +140,32 @@ def _audit_status(target_visual: Any, docx: Any, content: Any) -> str:
         return "needs_fix"
     if docx.supported and getattr(docx, "acknowledgement_format_errors", []):
         return "needs_fix"
+    if requirements is not None and getattr(requirements, "errors", []):
+        return "needs_fix"
     if any(issue.severity == "error" for issue in content.issues):
         return "needs_fix"
     return "review"
+
+
+def _docx_checks_for_document_kind(docx: Any, document_kind: str) -> Any:
+    if document_kind == THESIS or not getattr(docx, "supported", False):
+        return docx
+    return replace(
+        docx,
+        empty_paragraph_runs=[],
+        orphan_empty_paragraph_errors=[],
+        cover_format_errors=[],
+        abstract_format_errors=[],
+        toc_format_errors=[],
+        main_heading_format_errors=[],
+        sub_heading_format_errors=[],
+        body_paragraph_format_errors=[],
+        table_format_errors=[],
+        caption_format_errors=[],
+        reference_format_errors=[],
+        acknowledgement_format_errors=[],
+        red_rule_errors=[],
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -150,6 +185,8 @@ def _markdown_report(result: dict[str, Any]) -> str:
     target_visual = result["target_visual"]
     docx = result["docx"]
     content = result["content_review"]
+    document_profile = result.get("document_profile")
+    requirements = result.get("document_requirements")
 
     lines: list[str] = []
     lines.append("# Thesis Agent Audit Report")
@@ -158,6 +195,8 @@ def _markdown_report(result: dict[str, Any]) -> str:
     lines.append(f"- Status: `{result['status']}`")
     lines.append(f"- Template: `{result['files']['template']}`")
     lines.append(f"- Target: `{result['files']['target']}`")
+    if document_profile is not None:
+        lines.append(f"- Document type: `{getattr(document_profile, 'label', 'unknown')}` (`{getattr(document_profile, 'pipeline', 'unknown')}`)")
     lines.append("")
     lines.append("## Render")
     lines.append("")
@@ -211,6 +250,11 @@ def _markdown_report(result: dict[str, Any]) -> str:
         lines.append(f"- Acknowledgement format errors: {_fmt_list(getattr(docx, 'acknowledgement_format_errors', []))}")
     else:
         lines.append("- DOCX inspection skipped because the target is not `.docx`.")
+    if requirements is not None:
+        lines.append(f"- Required field errors: {_fmt_list(getattr(requirements, 'required_field_errors', []))}")
+        lines.append(f"- Signature errors: {_fmt_list(getattr(requirements, 'signature_errors', []))}")
+        lines.append(f"- Opinion errors: {_fmt_list(getattr(requirements, 'opinion_errors', []))}")
+        lines.append(f"- Metadata warnings: {_fmt_list(getattr(requirements, 'metadata_warnings', []))}")
     lines.append("")
     lines.append("## Content Review")
     lines.append("")

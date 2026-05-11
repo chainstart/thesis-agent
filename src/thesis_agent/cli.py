@@ -5,10 +5,12 @@ import json
 import re
 from pathlib import Path
 
-from .agent_run import process_thesis
+from .agent_run import process_document
 from .annotations import strip_red_annotations_from_docx
 from .config import AgentConfig
 from .format_fix import fix_docx_format
+from .document_profile import iter_supported_inputs
+from .metadata_store import default_metadata_store
 from .pipeline import run_audit
 from .rebuild import rebuild_thesis_docx
 from .slot_fill import fill_standard_template_docx
@@ -18,6 +20,7 @@ from .template_rebuild import rebuild_standard_template
 from .tools import Toolchain, command_version, probe_font
 from .visual_compare import compare_standard_template_visual
 from .vision_pack import build_vision_pack
+from .web_app import serve as serve_web_app
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,12 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     process.add_argument("--target", type=Path, required=True)
     process.add_argument("--out", type=Path, required=True)
     process.add_argument("--no-vision", action="store_true", help="Skip vision review pack generation.")
+    process.add_argument("--metadata-store", type=Path, default=None, help="Global student metadata JSON table.")
 
     batch = subparsers.add_parser("batch-process", help="Run process for every .doc/.docx in a directory.")
     batch.add_argument("--template", type=Path, required=True)
     batch.add_argument("--inputs", type=Path, required=True)
     batch.add_argument("--out", type=Path, required=True)
     batch.add_argument("--no-vision", action="store_true")
+    batch.add_argument("--metadata-store", type=Path, default=None, help="Global student metadata JSON table.")
 
     samples = subparsers.add_parser("list-samples", help="List bundled sample files.")
     samples.add_argument("--root", type=Path, default=Path("samples"))
@@ -87,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     vision_pack.add_argument("--out", type=Path, required=True)
     vision_pack.add_argument("--thumb-width", type=int, default=620)
     vision_pack.add_argument("--pages-per-sheet", type=int, default=6)
+
+    web = subparsers.add_parser("web", help="Start the local chat-style web UI.")
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8765)
 
     args = parser.parse_args(argv)
     config = AgentConfig.load(args.config)
@@ -152,17 +161,36 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if visual.passed else 1
     if args.command == "process":
-        result = process_thesis(args.template, args.target, args.out, config, toolchain, build_vision=not args.no_vision)
+        result = process_document(
+            args.template,
+            args.target,
+            args.out,
+            config,
+            toolchain,
+            build_vision=not args.no_vision,
+            metadata_store_path=args.metadata_store or default_metadata_store(args.out),
+        )
         print(json.dumps(_jsonable_dataclass(result), ensure_ascii=False, indent=2))
         return 0
     if args.command == "batch-process":
         args.out.mkdir(parents=True, exist_ok=True)
         results = []
-        for target in sorted(args.inputs.iterdir()):
-            if target.suffix.lower() not in {".doc", ".docx"}:
-                continue
-            out_dir = args.out / _slug(target.stem)
-            result = process_thesis(args.template, target, out_dir, config, toolchain, build_vision=not args.no_vision)
+        metadata_store = args.metadata_store or default_metadata_store(args.out)
+        for target in iter_supported_inputs(args.inputs):
+            try:
+                relative_stem = target.relative_to(args.inputs).with_suffix("")
+            except ValueError:
+                relative_stem = Path(target.stem)
+            out_dir = args.out / _slug(str(relative_stem))
+            result = process_document(
+                args.template,
+                target,
+                out_dir,
+                config,
+                toolchain,
+                build_vision=not args.no_vision,
+                metadata_store_path=metadata_store,
+            )
             results.append(_jsonable_dataclass(result))
         (args.out / "batch_result.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"count": len(results), "result": str(args.out / "batch_result.json")}, ensure_ascii=False))
@@ -176,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         pack = build_vision_pack(args.audit_dir, args.out, args.thumb_width, args.pages_per_sheet)
         print(json.dumps(_jsonable_dataclass(pack), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "web":
+        return serve_web_app(args.host, args.port)
     raise AssertionError(args.command)
 
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from .citation_style import has_malformed_inline_citation
+
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS = {"w": W_NS}
@@ -278,6 +280,8 @@ def _toc_format_errors(root: ET.Element) -> list[str]:
             continue
         parsed = _parse_toc_entry_text(text)
         if parsed is None:
+            if in_toc and _looks_like_toc_pollution(text):
+                errors.append(f"R023 {_short_text(text)}: 目录区域疑似混入正文或修改意见")
             continue
         in_toc = True
         title, _label = parsed
@@ -405,6 +409,39 @@ def _toc_heading_errors(paragraph: ET.Element, text: str) -> list[str]:
     return errors
 
 
+def _looks_like_toc_pollution(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    compact = re.sub(r"\s+", "", stripped)
+    if re.fullmatch(r"[IVXLCDMivxlcdm]+|\d+", compact):
+        return False
+    if _parse_toc_entry_text(stripped) is not None:
+        return False
+    if _looks_like_review_or_auto_text(stripped):
+        return True
+    return len(re.findall(r"[\u4e00-\u9fff]", stripped)) >= 45 and "\t" not in stripped and "..." not in stripped and "…" not in stripped
+
+
+def _looks_like_review_or_auto_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    patterns = [
+        r"评阅意见",
+        r"修改意见",
+        r"返修",
+        r"该图展示了",
+        r"论文撰写时还应",
+        r"综合全文来看",
+        r"从工程实现角度看.*论文还需要",
+        r"后续改进可从三方面展开",
+        r"因此，?论文终稿中应继续",
+        r"为进一步说明.*验证过程",
+        r"OCR未能自动提取",
+        r"需人工复核",
+    ]
+    return any(re.search(pattern, compact) for pattern in patterns)
+
+
 def _body_paragraph_format_errors(root: ET.Element) -> list[str]:
     body = root.find("w:body", NS)
     if body is None:
@@ -425,6 +462,10 @@ def _body_paragraph_format_errors(root: ET.Element) -> list[str]:
             continue
         label = _short_text(text)
         ppr = child.find("w:pPr", NS)
+        if _looks_like_review_or_auto_text(text):
+            errors.append(f"R050 {label}: 正文疑似混入评阅/修改意见或自动补写说明")
+        if has_malformed_inline_citation(text):
+            errors.append(f"R048 {label}: 正文引用编号格式异常，应写作 [2,6] 或 [2-6]")
         if _has_ppr_child(ppr, "numPr") or _has_ppr_child(ppr, "keepNext") or _has_ppr_child(ppr, "keepLines") or _has_ppr_child(ppr, "pageBreakBefore"):
             errors.append(f"R027/R028 {label}: 正文段落不应带列表、与下段同页或另起页控制")
         if _spacing_value(ppr, "before") not in {"0", None} or _spacing_value(ppr, "after") not in {"0", None}:
@@ -658,12 +699,19 @@ def _caption_format_errors(root: ET.Element) -> list[str]:
         ppr = paragraph.find("w:pPr", NS)
         if _ppr_value(ppr, "jc", "val") != "center":
             errors.append(f"R039/R041 {label}: 图表题注应居中")
+        if _caption_has_residual_indent_or_tabs(ppr):
+            errors.append(f"R039/R041 {label}: 图表题注不应残留左右缩进、首行缩进或制表位")
         if not _first_visible_run_matches(paragraph, east_asia="宋体", ascii_font="Times New Roman", size="18"):
             errors.append(f"R039/R041 {label}: 图表题注应为宋体小五号")
         if not _first_visible_run_bold(paragraph):
             errors.append(f"R039/R041 {label}: 图表题注应加粗")
-        if text.startswith("图") and not _previous_content_has_visual(children, idx):
+        previous_visual = _previous_visual_paragraph(children, idx) if text.startswith("图") else None
+        if text.startswith("图") and _caption_indicates_code_or_formula(text) and previous_visual is not None:
+            errors.append(f"R049 {label}: 代码或公式不应作为图片保留，应提取为代码文本或公式对象")
+        if text.startswith("图") and previous_visual is None:
             errors.append(f"R041 {label}: 图名上方应存在对应图片，不能只有图名")
+        if text.startswith("图") and previous_visual is not None and _ppr_value(previous_visual.find("w:pPr", NS), "jc", "val") != "center":
+            errors.append(f"R041 {label}: 图名上方图片应居中")
         if text.startswith("表") and not _next_content_is_table(children, idx):
             errors.append(f"R039 {label}: 表名应位于对应表格正上方")
         if len(errors) >= 30:
@@ -672,16 +720,20 @@ def _caption_format_errors(root: ET.Element) -> list[str]:
 
 
 def _previous_content_has_visual(children: list[ET.Element], idx: int) -> bool:
+    return _previous_visual_paragraph(children, idx) is not None
+
+
+def _previous_visual_paragraph(children: list[ET.Element], idx: int) -> ET.Element | None:
     for previous in reversed(children[:idx]):
         if previous.tag == f"{{{W_NS}}}tbl":
-            return False
+            return None
         if previous.tag != f"{{{W_NS}}}p":
             continue
         if previous.find(".//w:drawing", NS) is not None or previous.find(".//w:pict", NS) is not None or previous.find(".//w:object", NS) is not None:
-            return True
+            return previous
         if _paragraph_text(previous).strip():
-            return False
-    return False
+            return None
+    return None
 
 
 def _next_content_is_table(children: list[ET.Element], idx: int) -> bool:
@@ -694,6 +746,24 @@ def _next_content_is_table(children: list[ET.Element], idx: int) -> bool:
             continue
         return False
     return False
+
+
+def _caption_indicates_code_or_formula(text: str) -> bool:
+    return re.search(r"(代码|源码|公式)", re.sub(r"\s+", "", text)) is not None
+
+
+def _caption_has_residual_indent_or_tabs(ppr: ET.Element | None) -> bool:
+    if ppr is None:
+        return False
+    if ppr.find("w:tabs", NS) is not None:
+        return True
+    ind = ppr.find("w:ind", NS)
+    if ind is None:
+        return False
+    return any(
+        ind.get(f"{{{W_NS}}}{name}") not in {None, "0"}
+        for name in ("left", "leftChars", "right", "rightChars", "firstLine", "firstLineChars", "hanging", "hangingChars")
+    )
 
 
 def _reference_format_errors(root: ET.Element) -> list[str]:
@@ -733,6 +803,10 @@ def _reference_format_errors(root: ET.Element) -> list[str]:
             errors.append(f"R047 {label}: 参考文献编号应按出现次序连续编号，期望 [{expected}]")
             expected = number
         expected += 1
+        if _looks_like_review_or_auto_text(text):
+            errors.append(f"R047 {label}: 参考文献区域疑似混入正文或修改意见")
+        if not re.match(r"^\[\d+\] \S", text):
+            errors.append(f"R047 {label}: 参考文献编号后应按模板保留一个半角空格")
         ppr = child.find("w:pPr", NS)
         if (
             _has_ppr_child(ppr, "pStyle")
@@ -743,6 +817,10 @@ def _reference_format_errors(root: ET.Element) -> list[str]:
             errors.append(f"R047 {label}: 参考文献条目不应残留段落样式、列表或分页控制")
         if _has_reference_field_or_inline_style(child):
             errors.append(f"R047 {label}: 参考文献条目不应残留超链接域、域代码或字符样式")
+        if re.search(r"https?://", text, re.I):
+            errors.append(f"R047 {label}: 参考文献条目不应保留裸 URL，应转为规范著录文本")
+        if "丶" in text:
+            errors.append(f"R047 {label}: 参考文献条目不应包含异常昵称符号或错误标点")
         if _reference_spacing_issue(text):
             errors.append(f"R047 {label}: 参考文献著录标点后应按模板保留必要空格")
         if _spacing_value(ppr, "before") not in {"0", None} or _spacing_value(ppr, "after") not in {"0", None}:

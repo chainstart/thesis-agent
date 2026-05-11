@@ -84,6 +84,8 @@ def review_content(text: str, config: AgentConfig) -> ContentReview:
         if marker in text:
             issues.append(ReviewIssue("error", "forbidden-marker", f"发现不应保留的标记：{marker}"))
 
+    issues.extend(_pollution_issues(text))
+    issues.extend(_code_formula_image_issues(text))
     issues.extend(_formal_language_issues(text))
     issues.extend(_chapter_quality_issues(chapters, chapter_char_counts))
     issues.extend(_figure_explanation_issues(text))
@@ -128,6 +130,93 @@ def _formal_language_issues(text: str) -> list[ReviewIssue]:
     if re.search(r"[，,。；;：:]\s*[，,。；;：:]", text):
         issues.append(ReviewIssue("warning", "punctuation", "发现连续标点或异常标点组合，建议做形式校对。"))
     return issues[:10]
+
+
+def _pollution_issues(text: str) -> list[ReviewIssue]:
+    issues: list[ReviewIssue] = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if _looks_like_review_or_auto_text(line):
+            issues.append(ReviewIssue("error", "review-text-pollution", f"正文疑似混入评阅/修改意见或自动补写痕迹：{_short(line)}"))
+            break
+    toc_issue = _toc_pollution_issue(lines)
+    if toc_issue is not None:
+        issues.append(toc_issue)
+    reference_issue = _reference_pollution_issue(lines)
+    if reference_issue is not None:
+        issues.append(reference_issue)
+    return issues
+
+
+def _looks_like_review_or_auto_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    patterns = [
+        r"评阅意见",
+        r"修改意见",
+        r"返修",
+        r"该图展示了",
+        r"论文撰写时还应",
+        r"综合全文来看",
+        r"从工程实现角度看.*论文还需要",
+        r"后续改进可从三方面展开",
+        r"因此，?论文终稿中应继续",
+        r"为进一步说明.*验证过程",
+        r"OCR未能自动提取",
+        r"需人工复核",
+    ]
+    return any(re.search(pattern, compact) for pattern in patterns)
+
+
+def _toc_pollution_issue(lines: list[str]) -> ReviewIssue | None:
+    in_toc = False
+    for line in lines:
+        compact = re.sub(r"\s+", "", line)
+        if compact in {"目录", "目錄"}:
+            in_toc = True
+            continue
+        if not in_toc:
+            continue
+        if re.fullmatch(r"1\s*绪论", line):
+            return None
+        if _is_toc_entry_line(line) or re.fullmatch(r"[IVXLCDMivxlcdm]+|\d+", compact):
+            continue
+        if len(re.findall(r"[\u4e00-\u9fff]", line)) >= 45:
+            return ReviewIssue("error", "toc-pollution", f"目录区域疑似混入正文或修改意见：{_short(line)}")
+    return None
+
+
+def _reference_pollution_issue(lines: list[str]) -> ReviewIssue | None:
+    ref_indices = [idx for idx, line in enumerate(lines) if re.sub(r"\s+", "", line) == "参考文献"]
+    if not ref_indices:
+        return None
+    for line in lines[ref_indices[-1] + 1:]:
+        compact = re.sub(r"\s+", "", line)
+        if compact in {"致谢", "附录"}:
+            return None
+        if not re.match(r"^\[\d+\]", line):
+            continue
+        if _looks_like_reference_line(line):
+            continue
+        if len(re.findall(r"[\u4e00-\u9fff]", line)) >= 25:
+            return ReviewIssue("error", "reference-pollution", f"参考文献区域疑似混入正文或修改意见：{_short(line)}")
+    return None
+
+
+def _code_formula_image_issues(text: str) -> list[ReviewIssue]:
+    issues: list[ReviewIssue] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^图\s*\d+\s*[-－]\s*\d+", stripped) and re.search(r"(代码|源码|公式)", stripped):
+            issues.append(
+                ReviewIssue(
+                    "error",
+                    "code-formula-as-image",
+                    f"{_short(stripped)} 疑似把代码或公式保留为图片，应提取为代码文本或公式对象。",
+                )
+            )
+            if len(issues) >= 5:
+                break
+    return issues
 
 
 def _chapter_quality_issues(chapters: dict[str, str], chapter_char_counts: dict[str, int]) -> list[ReviewIssue]:
@@ -295,3 +384,8 @@ def _body_citation_numbers(text: str) -> set[str]:
     numbers = set(re.findall(r"\[(\d+)\]", body))
     numbers.update(re.findall(r"\[(\d+)(?=[,，、])", body))
     return numbers
+
+
+def _short(text: str, limit: int = 42) -> str:
+    compact = re.sub(r"\s+", "", text)
+    return compact[:limit] + ("..." if len(compact) > limit else "")

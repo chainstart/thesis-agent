@@ -19,9 +19,9 @@
   - 毕业设计（论文）AI 使用情况声明。
   - 毕业设计（论文）版权使用授权书。
 
-## 杨钰婷修复稿视觉审阅发现
+## 私有样本修复稿视觉审阅发现
 
-审阅包：`runs/fixes/yang-vision-pack/`
+审阅包：`runs/fixes/private-sample-vision-pack/`
 
 ### 格式问题
 

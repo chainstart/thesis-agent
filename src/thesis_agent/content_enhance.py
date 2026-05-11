@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from .citation_style import normalize_inline_citations
 from .docx_inspect import NS, W_NS, _paragraph_text
 from .ooxml import serialize_xml
 
@@ -19,6 +20,8 @@ class ContentEnhanceReport:
     output: Path
     test_chapter_augmented: bool = False
     acknowledgements_inserted: bool = False
+    figure_explanations_inserted: int = 0
+    balance_paragraphs_inserted: int = 0
     language_fixes_applied: int = 0
     inserted_paragraphs: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -38,12 +41,13 @@ def enhance_docx_content(input_path: Path, output_path: Path) -> ContentEnhanceR
         if body is None:
             raise ValueError("word/document.xml does not contain w:body")
 
-        full_text = "\n".join(_paragraph_text(p) for p in body.iter(_w("p")))
         language_fixes = _apply_language_cleanup(body)
-        if language_fixes:
-            full_text = "\n".join(_paragraph_text(p) for p in body.iter(_w("p")))
-        test_augmented, test_count = _augment_test_chapter(body, full_text)
-        ack_inserted, ack_count = _insert_acknowledgements(body, full_text)
+        test_augmented = False
+        test_count = 0
+        figure_count = 0
+        balance_count = 0
+        ack_inserted = False
+        ack_count = 0
 
         document_xml = _serialize_xml(root)
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
@@ -51,17 +55,16 @@ def enhance_docx_content(input_path: Path, output_path: Path) -> ContentEnhanceR
                 data = document_xml if item.filename == "word/document.xml" else zin.read(item.filename)
                 zout.writestr(item, data)
 
-    if not test_augmented:
-        warnings.append("No thin test chapter was found, or an augmentation section already exists.")
-    if not ack_inserted:
-        warnings.append("Acknowledgements already exist or no insertion point was needed.")
+    warnings.append("Generic content augmentation is disabled;正文补强必须绑定具体返修项后再写入。")
     return ContentEnhanceReport(
         input=input_path,
         output=output_path,
         test_chapter_augmented=test_augmented,
         acknowledgements_inserted=ack_inserted,
+        figure_explanations_inserted=figure_count,
+        balance_paragraphs_inserted=balance_count,
         language_fixes_applied=language_fixes,
-        inserted_paragraphs=test_count + ack_count,
+        inserted_paragraphs=test_count + figure_count + balance_count + ack_count,
         warnings=warnings,
     )
 
@@ -73,6 +76,7 @@ def _apply_language_cleanup(body: ET.Element) -> int:
         "雄安锡": "相应",
         "KeiluVision": "Keil uVision",
         "水质水质": "水质",
+        "模块模块": "模块",
     }
     fixed = 0
     for paragraph in body.iter(_w("p")):
@@ -84,6 +88,8 @@ def _apply_language_cleanup(body: ET.Element) -> int:
         updated = original
         for wrong, right in replacements.items():
             updated = updated.replace(wrong, right)
+        updated = re.sub(r"([，,。；;：:])\s*[，,。；;：:]+", r"\1", updated)
+        updated = normalize_inline_citations(updated)
         if updated != original:
             _replace_paragraph_text(paragraph, updated)
             fixed += 1
@@ -175,6 +181,153 @@ def _insert_acknowledgements(body: ET.Element, full_text: str) -> tuple[bool, in
     return True, len(paragraphs)
 
 
+def _augment_figure_explanations(body: ET.Element) -> int:
+    children = list(body)
+    insertions: list[tuple[int, ET.Element]] = []
+    current_chapter = ""
+    for idx, child in enumerate(children):
+        if child.tag != _w("p"):
+            continue
+        text = _paragraph_text(child).strip()
+        if _is_main_heading_text(text):
+            current_chapter = text
+            continue
+        if not _is_figure_caption(text):
+            continue
+        if _following_explanation_chars(children, idx) >= 80:
+            continue
+        insertions.append((idx + 1, _make_paragraph(_figure_explanation_text(text, current_chapter), kind="body")))
+    for offset, (idx, paragraph) in enumerate(insertions):
+        body.insert(idx + offset, paragraph)
+    return len(insertions)
+
+
+def _is_main_heading_text(text: str) -> bool:
+    return re.match(r"^[1-9]\s+[\u4e00-\u9fffA-Za-z]", text) is not None
+
+
+def _is_subheading_text(text: str) -> bool:
+    return re.match(r"^[1-9]\.\d+(?:\.\d+)?\s+", text) is not None
+
+
+def _is_figure_caption(text: str) -> bool:
+    return re.match(r"^图\s*\d+\s*[-－]\s*\d+", text) is not None
+
+
+def _is_any_caption(text: str) -> bool:
+    return re.match(r"^(图|表)\s*\d+\s*[-－]\s*\d+", text) is not None
+
+
+def _following_explanation_chars(children: list[ET.Element], caption_idx: int) -> int:
+    chunks: list[str] = []
+    for child in children[caption_idx + 1:]:
+        if child.tag != _w("p"):
+            continue
+        text = _paragraph_text(child).strip()
+        if not text:
+            continue
+        if _is_any_caption(text) or _is_main_heading_text(text) or _is_subheading_text(text):
+            break
+        chunks.append(text)
+        if len(re.findall(r"[\u4e00-\u9fff]", "".join(chunks))) >= 80:
+            break
+    return len(re.findall(r"[\u4e00-\u9fff]", "".join(chunks)))
+
+
+def _figure_explanation_text(caption: str, chapter: str) -> str:
+    label = re.sub(r"\s+", " ", caption).strip()
+    title = re.sub(r"^图\s*\d+\s*[-－]\s*\d+\s*", "", label).strip() or "该模块"
+    chapter_hint = "本章" if not chapter else re.sub(r"^[1-9]\s+", "", chapter).strip()
+    return (
+        f"该图展示了{title}在{chapter_hint}中的结构、接口或运行状态。"
+        "从图中可以进一步核对模块边界、信号流向、关键参数和实现结果，"
+        "并与前文设计目标形成对应关系。后续调试时应结合该图检查连接关系、"
+        "配置项和输出数据是否一致，作为判断系统功能完整性与稳定性的依据。"
+        "论文撰写时还应围绕图中的输入输出关系补充必要解释，说明该部分如何支撑需求分析、模块实现和测试验证。"
+    )
+
+
+def _augment_chapter_balance(body: ET.Element, full_text: str) -> int:
+    children = list(body)
+    ranges = _main_chapter_ranges(children)
+    if len(ranges) < 3:
+        return 0
+    counts = []
+    for start_idx, end_idx, title in ranges:
+        text = "\n".join(_paragraph_text(child) for child in children[start_idx + 1:end_idx] if child.tag == _w("p"))
+        counts.append((start_idx, end_idx, title, len(re.findall(r"[\u4e00-\u9fff]", text))))
+    max_chars = max(count for *_rest, count in counts)
+    min_required = max(900, int(max_chars / 4.3))
+    domain = _infer_domain(full_text)
+    components = _infer_components(full_text)
+    insertions: list[tuple[int, ET.Element]] = []
+    for _start_idx, end_idx, title, count in counts:
+        if count >= min_required:
+            continue
+        if not re.search(r"(测试|调试|验证|实验|总结|展望|结论)", title):
+            continue
+        for paragraph_text in _balance_paragraphs(title, domain, components):
+            insertions.append((end_idx, _make_paragraph(paragraph_text, kind="body")))
+    for offset, (idx, paragraph) in enumerate(insertions):
+        body.insert(idx + offset, paragraph)
+    return len(insertions)
+
+
+def _main_chapter_ranges(children: list[ET.Element]) -> list[tuple[int, int, str]]:
+    headings: list[tuple[int, str]] = []
+    for idx, child in enumerate(children):
+        if child.tag != _w("p"):
+            continue
+        text = _paragraph_text(child).strip()
+        if _is_main_heading_text(text):
+            headings.append((idx, text))
+    ranges: list[tuple[int, int, str]] = []
+    for pos, (idx, title) in enumerate(headings):
+        end_idx = headings[pos + 1][0] if pos + 1 < len(headings) else _body_insert_end(children)
+        ranges.append((idx, end_idx, title))
+    return ranges
+
+
+def _balance_paragraphs(title: str, domain: str, components: str) -> list[str]:
+    if re.search(r"(总结|展望|结论)", title):
+        return [
+            (
+                f"综合全文来看，{domain}围绕实际应用场景完成了需求分析、总体方案、模块设计、程序实现和测试验证等工作。"
+                f"系统实现过程中重点关注{'、' + components if components else '关键硬件模块、通信链路和管理端功能'}之间的协同关系，"
+                "通过分模块设计降低了系统耦合度，也便于后续排查采集异常、通信异常和执行机构响应异常等问题。"
+            ),
+            (
+                "从工程实现角度看，论文还需要把需求、设计、实现和测试之间的对应关系表达得更加清楚。"
+                "每一项核心需求都应能在总体设计中找到对应模块，在实现章节中找到关键处理流程，并在测试章节中找到验证证据。"
+                "这种闭环关系能够提高论文论证的完整性，也便于评阅教师判断系统是否真正满足毕业设计任务要求。"
+            ),
+            (
+                "后续改进可从三方面展开：一是增加更多现场样本和长时间连续运行数据，验证系统在不同环境条件下的稳定性；"
+                "二是完善异常数据过滤、断线重连和日志记录机制，提高系统容错能力；三是结合用户使用反馈优化界面展示、报警阈值和维护流程，"
+                "使系统更贴近真实工程应用要求。"
+            ),
+            (
+                "此外，后续工作还可以进一步完善数据记录和维护机制，对关键事件、异常报警和用户操作进行持续留痕。"
+                "通过积累运行数据，可以为阈值优化、故障诊断和功能迭代提供依据，使系统从课程设计式实现进一步过渡到可维护、可复用的工程应用。"
+            ),
+            (
+                "因此，论文终稿中应继续围绕工程应用价值进行收束，突出系统已完成的功能边界、仍存在的限制条件以及后续改进方向，"
+                "使总结部分能够回应前文提出的设计目标和测试结果。"
+            ),
+        ]
+    return [
+        (
+            f"为进一步说明{domain}的验证过程，本章测试不仅关注单个功能是否能够运行，还需要关注模块之间的数据传递是否连续、"
+            "异常状态是否能够被识别以及处理结果是否能够回到稳定状态。测试记录应覆盖输入条件、操作步骤、预期结果和实测现象，"
+            "从而支撑论文对系统可靠性和可用性的判断。"
+        ),
+        (
+            "在结果分析中，应结合图表和实际调试现象说明问题来源。例如，当采集值波动较大时，需要判断是传感器稳定时间、供电干扰还是程序滤波策略造成；"
+            "当通信或显示结果延迟时，需要检查串口、网络连接和刷新周期设置。通过这种方式，可以把测试章节从现象描述提升为工程问题分析。"
+        ),
+    ]
+
+
 def _find_test_chapter(children: list[ET.Element]) -> tuple[int, int, str, str] | None:
     headings: list[tuple[int, str, str]] = []
     for idx, child in enumerate(children):
@@ -245,9 +398,9 @@ def _body_insert_end(children: list[ET.Element]) -> int:
 
 def _infer_domain(text: str) -> str:
     if "危化品" in text:
-        return "危化品智能监管系统"
+        return "安全监管系统"
     if "冷链" in text or "温控" in text:
-        return "冷链物流温控追踪系统"
+        return "温控追踪系统"
     if "停车场" in text or "车位" in text:
         return "停车场管理系统"
     if "物联网" in text:

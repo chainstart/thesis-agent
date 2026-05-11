@@ -9,6 +9,7 @@ from xml.etree import ElementTree as ET
 
 from .docx_inspect import NS, W_NS, _paragraph_text
 from .ooxml import serialize_package_xml, serialize_xml
+from .reference_style import normalize_reference_text
 
 
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -127,7 +128,7 @@ def fix_docx_format(
 
         if preserve_template_front_matter:
             front_breaks = 0
-            front_lines = 0
+            front_lines = _normalize_authorization_title_offset(body)
         else:
             front_breaks = _ensure_front_matter_page_boundaries(body)
             front_lines = _normalize_front_matter_lines(body)
@@ -228,10 +229,12 @@ class FrontMatterImport:
 def _resolve_template_docx(template_path: Path | None) -> Path | None:
     if template_path is None:
         return None
+    if template_path.name.startswith("~$"):
+        return None
     if template_path.suffix.lower() == ".docx" and template_path.exists():
         return template_path
     candidate = template_path.with_suffix(".docx")
-    if candidate.exists():
+    if not candidate.name.startswith("~$") and candidate.exists():
         return candidate
     return None
 
@@ -404,12 +407,20 @@ def _front_matter_page_anchor_indices(children: list[ET.Element]) -> list[int]:
         anchor_idx = idx
         if compact.startswith("毕业设计（论文）") and idx > 0:
             previous_text = re.sub(r"\s+", "", _paragraph_text(children[idx - 1]) if children[idx - 1].tag == _w("p") else "")
-            if previous_text == "上海电机学院":
+            if _looks_like_school_heading(previous_text):
                 anchor_idx = idx - 1
         if anchor_idx > 0 and anchor_idx not in seen:
             anchors.append(anchor_idx)
             seen.add(anchor_idx)
     return anchors
+
+
+def _looks_like_school_heading(text: str) -> bool:
+    if not text:
+        return False
+    if len(text) > 20:
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff](大学|学院)$", text))
 
 
 def _normalize_front_matter_section_references(elements: list[ET.Element], target_rels_xml: bytes) -> None:
@@ -461,7 +472,7 @@ def _looks_like_header_title(text: str) -> bool:
     if re.match(r"^[0-9一二三四五六七八九十]+[．.、)]", compact):
         return False
     banned = [
-        "上海电机学院",
+        "学校名称",
         "学术诚信声明",
         "使用情况声明",
         "版权使用授权书",
@@ -477,6 +488,7 @@ def _looks_like_header_title(text: str) -> bool:
         "指导教师",
         "专业",
         "学院",
+        "大学",
         "日期",
     ]
     if any(item in compact for item in banned):
@@ -487,16 +499,7 @@ def _looks_like_header_title(text: str) -> bool:
 def _fallback_header_title_from_body(body: ET.Element) -> str | None:
     text = "\n".join(_paragraph_text(p) for p in body.iter(_w("p")))
     compact = re.sub(r"\s+", "", text)
-    candidates = [
-        ("危化品" in compact and "监管系统" in compact, "智能危化品监管系统"),
-        ("冷链" in compact and "温控" in compact, "冷链物流温控追踪系统"),
-        ("水产" in compact and "监测系统" in compact, "智慧渔业水产养殖监测系统设计"),
-        ("停车" in compact and "管理系统" in compact, "停车场管理系统"),
-    ]
-    for matched, title in candidates:
-        if matched:
-            return title
-    for match in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9]{4,24}系统(?:设计|实现|研究)?)", compact):
+    for match in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9]{4,32}(?:系统|平台|装置|软件|应用|模型|算法|方案)(?:设计|实现|研究|开发)?)", compact):
         candidate = match.group(1)
         if _looks_like_header_title(candidate):
             return candidate
@@ -1020,6 +1023,82 @@ def _normalize_front_matter_lines(body: ET.Element) -> int:
     return fixed
 
 
+def _normalize_authorization_title_offset(body: ET.Element) -> int:
+    children = list(body)
+    fixed = 0
+    for idx, child in enumerate(children):
+        if child.tag != _w("p"):
+            continue
+        if "版权使用授权书" not in _paragraph_text(child):
+            continue
+        school_idx = None
+        for prev_idx in range(idx - 1, -1, -1):
+            previous = children[prev_idx]
+            if previous.tag != _w("p"):
+                continue
+            text = _paragraph_text(previous).strip()
+            if text:
+                school_idx = prev_idx if text == "上海电机学院" else None
+                break
+        if school_idx is None:
+            continue
+        blank_indices: list[int] = []
+        for prev_idx in range(school_idx - 1, -1, -1):
+            previous = children[prev_idx]
+            if previous.tag != _w("p") or _paragraph_text(previous).strip():
+                break
+            if (
+                previous.find(".//w:br[@w:type='page']", NS) is not None
+                or previous.find("w:pPr/w:sectPr", NS) is not None
+            ):
+                break
+            blank_indices.append(prev_idx)
+        blank_indices = sorted(blank_indices)
+        for blank_idx in blank_indices:
+            if _set_blank_front_line_spacing(children[blank_idx], "480"):
+                fixed += 1
+        target_blank_lines = 2
+        while len(blank_indices) > target_blank_lines:
+            remove_idx = blank_indices.pop(0)
+            body.remove(children[remove_idx])
+            children.pop(remove_idx)
+            blank_indices = [item - 1 if item > remove_idx else item for item in blank_indices]
+            school_idx -= 1
+            fixed += 1
+        while len(blank_indices) < target_blank_lines:
+            blank = _front_blank_paragraph("480")
+            body.insert(school_idx, blank)
+            children.insert(school_idx, blank)
+            blank_indices.append(school_idx)
+            school_idx += 1
+            fixed += 1
+        break
+    return fixed
+
+
+def _front_blank_paragraph(line: str) -> ET.Element:
+    paragraph = ET.Element(_w("p"))
+    ppr = ET.SubElement(paragraph, _w("pPr"))
+    spacing = ET.SubElement(ppr, _w("spacing"))
+    spacing.set(_w("line"), line)
+    spacing.set(_w("lineRule"), "auto")
+    return paragraph
+
+
+def _set_blank_front_line_spacing(paragraph: ET.Element, line: str) -> bool:
+    if _paragraph_text(paragraph).strip():
+        return False
+    ppr = _ensure_ppr(paragraph)
+    spacing = ppr.find("w:spacing", NS)
+    if spacing is None:
+        spacing = ET.Element(_w("spacing"))
+        _insert_ppr_child_ordered(ppr, spacing, "spacing")
+    changed = spacing.attrib.get(_w("line")) != line or spacing.attrib.get(_w("lineRule")) != "auto"
+    spacing.set(_w("line"), line)
+    spacing.set(_w("lineRule"), "auto")
+    return changed
+
+
 def _normalize_body_paragraph_format(body: ET.Element) -> int:
     children = list(body)
     first_heading_idx = None
@@ -1242,12 +1321,28 @@ def _normalize_abstract_and_keywords(body: ET.Element) -> int:
         if compact in {"目录", "目錄"} or _is_first_main_heading(text):
             break
         if compact == "摘要":
-            _format_front_heading(child, east_asia="黑体", ascii_font="黑体", size="36", bold=True)
+            _format_front_heading(
+                child,
+                east_asia="黑体",
+                ascii_font="黑体",
+                size="36",
+                bold=True,
+                before="0",
+                template_spacing="zh_abstract",
+            )
             section = "zh_abstract"
             count += 1
             continue
         if compact in {"ABSTRACT"}:
-            _format_front_heading(child, east_asia="Times New Roman", ascii_font="Times New Roman", size="36", bold=True)
+            _format_front_heading(
+                child,
+                east_asia="Times New Roman",
+                ascii_font="Times New Roman",
+                size="36",
+                bold=True,
+                before="624",
+                template_spacing="en_abstract",
+            )
             section = "en_abstract"
             count += 1
             continue
@@ -1274,16 +1369,17 @@ def _normalize_abstract_and_keywords(body: ET.Element) -> int:
     return count
 
 
-def _format_front_heading(p: ET.Element, east_asia: str, ascii_font: str, size: str, bold: bool) -> None:
+def _format_front_heading(
+    p: ET.Element,
+    east_asia: str,
+    ascii_font: str,
+    size: str,
+    bold: bool,
+    before: str = "0",
+    template_spacing: str | None = None,
+) -> None:
     ppr = _ensure_ppr(p)
-    spacing = ppr.find("w:spacing", NS)
-    if spacing is None:
-        spacing = ET.Element(_w("spacing"))
-        _insert_ppr_child_ordered(ppr, spacing, "spacing")
-    spacing.set(_w("before"), "0")
-    spacing.set(_w("after"), "240")
-    spacing.set(_w("line"), "300")
-    spacing.set(_w("lineRule"), "auto")
+    _set_front_heading_spacing(p, ppr, before, template_spacing)
     jc = ppr.find("w:jc", NS)
     if jc is None:
         jc = ET.Element(_w("jc"))
@@ -1293,8 +1389,35 @@ def _format_front_heading(p: ET.Element, east_asia: str, ascii_font: str, size: 
     if ind is not None:
         for name in ("firstLine", "firstLineChars", "hanging", "hangingChars"):
             ind.attrib.pop(_w(name), None)
+    preserve_template_runs = template_spacing is not None and p.find(".//w:br[@w:type='page']", NS) is not None
     for run in p.findall("w:r", NS):
+        if preserve_template_runs and not _run_has_visible_text(run):
+            continue
         _set_run_font(run, east_asia=east_asia, ascii_font=ascii_font, size=size, bold=bold)
+
+
+def _run_has_visible_text(run: ET.Element) -> bool:
+    return any((node.text or "").strip() for node in run.findall("w:t", NS))
+
+
+def _set_front_heading_spacing(p: ET.Element, ppr: ET.Element, before: str, template_spacing: str | None) -> None:
+    spacing = ppr.find("w:spacing", NS)
+    has_page_break = p.find(".//w:br[@w:type='page']", NS) is not None
+    if has_page_break and template_spacing == "zh_abstract":
+        if spacing is not None:
+            ppr.remove(spacing)
+        return
+    if has_page_break and template_spacing == "en_abstract":
+        if spacing is not None:
+            ppr.remove(spacing)
+        return
+    if spacing is None:
+        spacing = ET.Element(_w("spacing"))
+        _insert_ppr_child_ordered(ppr, spacing, "spacing")
+    spacing.set(_w("before"), before)
+    spacing.set(_w("after"), "240")
+    spacing.set(_w("line"), "300")
+    spacing.set(_w("lineRule"), "auto")
 
 
 def _set_abstract_paragraph_format(p: ET.Element, east_asia: str, ascii_font: str) -> None:
@@ -1350,13 +1473,15 @@ def _format_keyword_paragraph(p: ET.Element, english: bool) -> None:
         if existing is not None:
             ppr.remove(existing)
     spacing = ppr.find("w:spacing", NS)
-    if spacing is None:
-        spacing = ET.Element(_w("spacing"))
-        _insert_ppr_child_ordered(ppr, spacing, "spacing")
-    spacing.set(_w("before"), "0")
-    spacing.set(_w("after"), "240")
-    spacing.set(_w("line"), "300")
-    spacing.set(_w("lineRule"), "auto")
+    if english:
+        if spacing is None:
+            spacing = ET.Element(_w("spacing"))
+            _insert_ppr_child_ordered(ppr, spacing, "spacing")
+        spacing.attrib.clear()
+        spacing.set(_w("line"), "360")
+        spacing.set(_w("lineRule"), "auto")
+    elif spacing is not None:
+        ppr.remove(spacing)
     ind = ppr.find("w:ind", NS)
     if ind is not None:
         for name in ("firstLine", "firstLineChars", "hanging", "hangingChars"):
@@ -1486,17 +1611,7 @@ def _set_reference_number(p: ET.Element, number: int) -> bool:
 
 
 def _normalize_reference_text(text: str) -> str:
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if not normalized:
-        return normalized
-    normalized = re.sub(r"\s+([,.;:])", r"\1", normalized)
-    normalized = re.sub(r"(?<=[\u4e00-\u9fff\]\)])\.(?=[A-Za-z\u4e00-\u9fff\[])", ". ", normalized)
-    normalized = re.sub(r"(?<=\])\.(?=\S)", ". ", normalized)
-    normalized = re.sub(r",(?=\d{4})", ", ", normalized)
-    normalized = re.sub(r"(?<=\d{4}),(?=[\d(（])", ", ", normalized)
-    normalized = re.sub(r"\.(?=DOI:)", ". ", normalized, flags=re.IGNORECASE)
-    normalized = re.sub(r"\s{2,}", " ", normalized).strip()
-    return normalized
+    return normalize_reference_text(text)
 
 
 def _has_reference_field_or_inline_style(p: ET.Element) -> bool:
@@ -1719,11 +1834,14 @@ def _apply_caption_keep_rules(body: ET.Element) -> int:
         if text.startswith("表"):
             _set_on_off_ppr(child, "keepNext", True)
         elif text.startswith("图"):
+            _remove_ppr_child(child, "keepNext")
             previous = _previous_paragraph_with_content(children, idx)
             previous_text = _paragraph_text(previous).strip() if previous is not None else ""
             if previous is not None and not _is_normal_body_paragraph(previous, previous_text):
                 _set_on_off_ppr(previous, "keepNext", True)
                 _set_on_off_ppr(previous, "keepLines", True)
+                if _paragraph_has_visual(previous):
+                    _center_visual_paragraph(previous)
         count += 1
     return count
 
@@ -1754,6 +1872,20 @@ def _normalize_caption_format(body: ET.Element) -> int:
         if not re.match(r"^(图|表)\s*\d+\s*[-－]\s*\d+", text):
             continue
         ppr = _ensure_ppr(child)
+        for name in (
+            "pStyle",
+            "numPr",
+            "ind",
+            "tabs",
+            "keepNext",
+            "pageBreakBefore",
+            "autoSpaceDE",
+            "autoSpaceDN",
+            "adjustRightInd",
+        ):
+            existing = ppr.find(f"w:{name}", NS)
+            if existing is not None:
+                ppr.remove(existing)
         spacing = ppr.find("w:spacing", NS)
         if spacing is None:
             spacing = ET.Element(_w("spacing"))
@@ -1779,6 +1911,19 @@ def _paragraph_has_visual(paragraph: ET.Element) -> bool:
         or paragraph.find(".//w:pict", NS) is not None
         or paragraph.find(".//w:object", NS) is not None
     )
+
+
+def _center_visual_paragraph(paragraph: ET.Element) -> None:
+    ppr = _ensure_ppr(paragraph)
+    for name in ("ind", "tabs"):
+        existing = ppr.find(f"w:{name}", NS)
+        if existing is not None:
+            ppr.remove(existing)
+    jc = ppr.find("w:jc", NS)
+    if jc is None:
+        jc = ET.Element(_w("jc"))
+        _insert_ppr_child_ordered(ppr, jc, "jc")
+    jc.set(_w("val"), "center")
 
 
 def _fix_toc_headings(body: ET.Element) -> int:
@@ -1990,6 +2135,8 @@ def _set_run_font(run: ET.Element, east_asia: str, ascii_font: str, size: str, b
     fonts.set(_w("eastAsia"), east_asia)
     fonts.set(_w("ascii"), ascii_font)
     fonts.set(_w("hAnsi"), ascii_font)
+    for name in ("eastAsiaTheme", "asciiTheme", "hAnsiTheme", "cstheme"):
+        fonts.attrib.pop(_w(name), None)
 
     for name in ("sz", "szCs"):
         node = rpr.find(f"w:{name}", NS)

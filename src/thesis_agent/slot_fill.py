@@ -8,8 +8,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from .citation_style import normalize_inline_citations
 from .docx_inspect import NS, W_NS, _paragraph_text
 from .ooxml import serialize_package_xml, serialize_xml
+from .reference_style import normalize_reference_text
 from .rebuild import (
     CT_NS,
     REL_NS,
@@ -20,11 +22,17 @@ from .rebuild import (
     _extract_source_content,
     _has_visible_content,
     _import_source_relationships,
+    _page_break_paragraph,
     _resolve_template_docx,
     _sanitize_imported_body_element,
     _toc_titles_from_body,
     _w,
 )
+
+
+COVER_UNDERLINE_SPACE = "\u00A0"
+COVER_UNDERLINE_SPACE_FACTOR = 2
+COVER_CJK_SPACE_UNITS = 4
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,7 @@ class SlotFillReport:
     body_elements: int = 0
     reference_items: int = 0
     acknowledgement_paragraphs: int = 0
+    appendix_elements: int = 0
     imported_relationships: int = 0
     imported_parts: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -85,7 +94,12 @@ class AbstractParts:
     en_keywords: str | None
 
 
-def fill_standard_template_docx(template_path: Path, source_docx: Path, output_path: Path) -> SlotFillReport:
+def fill_standard_template_docx(
+    template_path: Path,
+    source_docx: Path,
+    output_path: Path,
+    metadata_overrides: dict[str, str] | None = None,
+) -> SlotFillReport:
     """Fill a formal standard thesis template with extracted student content.
 
     The template owns all page geometry, front-matter declarations, section
@@ -118,6 +132,10 @@ def fill_standard_template_docx(template_path: Path, source_docx: Path, output_p
         metadata = _extract_metadata(extracted.cover, list(source_body), source_docx)
         if extracted.title:
             metadata.setdefault("title", extracted.title)
+        if metadata_overrides:
+            for key, value in metadata_overrides.items():
+                if value:
+                    metadata.setdefault(key, value)
         abstract = _parse_abstract_parts(extracted.abstract)
         if not abstract.zh_paragraphs:
             warnings.append("未识别到中文摘要正文，保留模板摘要样式并留空。")
@@ -137,14 +155,14 @@ def fill_standard_template_docx(template_path: Path, source_docx: Path, output_p
         )
         content_types = ET.fromstring(content_types_xml)
         imported = _import_source_relationships(
-            elements=[*extracted.body, *extracted.references, *extracted.acknowledgements],
+            elements=[*extracted.body, *extracted.references, *extracted.acknowledgements, *extracted.appendices],
             source_zip=source_zip,
             target_rels=target_rels,
             content_types=content_types,
             existing_names=set(template_zip.namelist()),
         )
 
-        toc_titles = _toc_titles_from_body(extracted.body, extracted.references, extracted.acknowledgements)
+        toc_titles = _toc_titles_from_body(extracted.body, extracted.references, extracted.acknowledgements, extracted.appendices)
         new_elements: list[ET.Element] = []
         front, filled_fields = _fill_cover_fields(slots.front, metadata)
         new_elements.extend(front)
@@ -156,6 +174,8 @@ def fill_standard_template_docx(template_path: Path, source_docx: Path, output_p
         new_elements.extend(reference_elements)
         acknowledgement_elements = _filled_acknowledgement_elements(slots, extracted.acknowledgements)
         new_elements.extend(acknowledgement_elements)
+        appendix_elements = _filled_appendix_elements(extracted.appendices)
+        new_elements.extend(appendix_elements)
         if slots.final_section is not None:
             new_elements.append(copy.deepcopy(slots.final_section))
 
@@ -205,6 +225,7 @@ def fill_standard_template_docx(template_path: Path, source_docx: Path, output_p
         body_elements=len(body_elements),
         reference_items=max(0, len(reference_elements) - 1),
         acknowledgement_paragraphs=max(0, len(acknowledgement_elements) - 1),
+        appendix_elements=len(appendix_elements),
         imported_relationships=imported.relationships,
         imported_parts=sorted(imported.parts),
         warnings=warnings,
@@ -365,10 +386,16 @@ def _extract_metadata(cover: list[ET.Element], all_children: list[ET.Element], s
     }
     for line in [part.strip() for part in text.splitlines() if part.strip()]:
         cleaned = re.sub(r"[_＿]{2,}", "", line).strip()
-        for label, key in labels.items():
-            match = re.search(rf"{label}\s*[:：]\s*(.+)$", cleaned)
-            if match and match.group(1).strip():
-                metadata[key] = match.group(1).strip()
+        match = re.search(r"^(.+?)\s*[:：]\s*(.+)$", cleaned)
+        if not match:
+            continue
+        label_text = re.sub(r"\s+", "", match.group(1))
+        value = re.sub(r"[_＿\s]+", "", match.group(2)).strip()
+        if not value:
+            continue
+        key = labels.get(label_text)
+        if key:
+            metadata[key] = value
     title = _infer_title_from_lines(text.splitlines()) if cover else None
     if title:
         metadata["title"] = title
@@ -402,10 +429,15 @@ def _looks_like_title(text: str) -> bool:
     compact = _compact(text)
     if len(compact) < 8 or len(compact) > 45:
         return False
+    if compact.startswith(("本文", "本研究", "本课题", "该系统", "系统以", "通过", "为了", "在高校")):
+        return False
+    if any(mark in compact for mark in "，,。；;"):
+        return False
     if re.match(r"^[1-9](?:\.\d+)*", compact):
         return False
     banned = [
-        "上海电机学院",
+        "学校名称",
+        "大学",
         "学生姓名",
         "学生学号",
         "指导教师",
@@ -424,23 +456,32 @@ def _looks_like_title(text: str) -> bool:
 
 
 def _fallback_title_from_document(text: str, source_docx: Path) -> str | None:
-    compact = _compact(text)
-    candidates = [
-        ("危化品" in compact and "监管" in compact, "智能危化品监管系统"),
-        ("冷链" in compact and "温控" in compact, "冷链物流温控追踪系统"),
-        ("水产" in compact and "监测系统" in compact, "智慧渔业水产养殖监测系统设计"),
-        ("停车" in compact and "空气" in compact and ("检测" in compact or "监测" in compact), "地下停车场空气检测系统"),
-        ("停车" in compact and "管理系统" in compact, "停车场管理系统"),
-    ]
-    for matched, title in candidates:
-        if matched:
-            return title
     stem = re.sub(r"(毕业论文|论文|初稿|终稿|修改稿)", "", source_docx.stem)
     parts = [part.strip() for part in re.split(r"[-_]", stem) if part.strip()]
     for part in reversed(parts):
         if _looks_like_title(part):
             return part
+    compact = _compact(text)
+    for pattern in (
+        r"基于[^，。；;,.]{2,24}的[^，。；;,.]{4,30}(?:系统|平台|装置|软件|应用|模型|算法|方案)(?:设计|实现|研究|开发)?",
+        r"[^，。；;,.]{4,24}(?:智能监管系统|监测系统|管理系统|控制系统)(?:设计|实现|研究|开发)?",
+    ):
+        for match in re.finditer(pattern, compact):
+            candidate = _normalize_inferred_title(match.group(0))
+            if _looks_like_title(candidate):
+                return candidate
+    for match in re.finditer(r"([\u4e00-\u9fffA-Za-z0-9]{4,32}(?:系统|平台|装置|软件|应用|模型|算法|方案)(?:设计|实现|研究|开发)?)", compact):
+        candidate = _normalize_inferred_title(match.group(1))
+        if _looks_like_title(candidate):
+            return candidate
     return None
+
+
+def _normalize_inferred_title(text: str) -> str:
+    title = re.sub(r"^(一套|一个|一种)", "", text.strip())
+    if re.search(r"(系统|平台|装置|软件|应用|模型|算法|方案)$", title):
+        title += "设计"
+    return title
 
 
 def _fill_cover_fields(front: list[ET.Element], metadata: dict[str, str]) -> tuple[list[ET.Element], int]:
@@ -456,40 +497,102 @@ def _fill_cover_fields(front: list[ET.Element], metadata: dict[str, str]) -> tup
             filled += 1
             continue
         field_key = _cover_field_key(text)
-        if field_key and metadata.get(field_key):
-            if _replace_cover_underline_value(paragraph, metadata[field_key]):
-                filled += 1
+        if field_key:
+            field_value = metadata.get(field_key, "")
+            if _replace_cover_underline_value(paragraph, field_value):
+                if field_value:
+                    filled += 1
                 continue
             prefix = text.split("：", 1)[0] + "：" if "：" in text else text.split(":", 1)[0] + ":"
-            _set_paragraph_text(paragraph, f"{prefix}{metadata[field_key]}")
-            filled += 1
+            if field_value:
+                _set_paragraph_text(paragraph, f"{prefix}{field_value}")
+                filled += 1
     return result, filled
 
 
 def _replace_cover_underline_value(paragraph: ET.Element, value: str) -> bool:
-    if not value:
+    text = _paragraph_text(paragraph)
+    match = re.search(r"_{4,}", text)
+    if not match:
         return False
-    for run in paragraph.findall("w:r", NS):
-        for text_node in run.findall("w:t", NS):
-            text = text_node.text or ""
-            match = re.search(r"_{4,}", text)
-            if not match:
-                continue
-            residual = max(4, match.end() - match.start() - _display_width_units(value))
-            replacement = value + "_" * residual
-            text_node.text = text[: match.start()] + replacement + text[match.end() :]
-            if re.search(r"^\s|\s$", text_node.text or "") or re.search(r"\s{2,}", text_node.text or ""):
-                text_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            _set_run_underline(run)
-            return True
-    return False
+    underline_units = match.end() - match.start()
+    target_units = underline_units * COVER_UNDERLINE_SPACE_FACTOR
+    value_units = _cover_field_space_units(value)
+    remaining = max(0, target_units - value_units)
+    left = remaining // 2
+    right = remaining - left
+    _rebuild_cover_field_paragraph_with_value(
+        paragraph,
+        prefix=text[: match.start()],
+        left_line=COVER_UNDERLINE_SPACE * left,
+        value=value,
+        right_line=COVER_UNDERLINE_SPACE * right,
+        suffix=text[match.end() :],
+    )
+    return True
 
 
-def _display_width_units(text: str) -> int:
+def _rebuild_cover_field_paragraph_with_value(
+    paragraph: ET.Element,
+    prefix: str,
+    left_line: str,
+    value: str,
+    right_line: str,
+    suffix: str,
+) -> None:
+    ppr = paragraph.find("w:pPr", NS)
+    preserved_ppr = copy.deepcopy(ppr) if ppr is not None else None
+    base_rpr = _first_run_properties(paragraph)
+    for child in list(paragraph):
+        paragraph.remove(child)
+    if preserved_ppr is not None:
+        paragraph.append(preserved_ppr)
+    if prefix:
+        _append_cover_run(paragraph, prefix, base_rpr, underline=False)
+    _append_cover_run(paragraph, f"{left_line}{value}{right_line}", base_rpr, underline=True)
+    if suffix:
+        _append_cover_run(paragraph, suffix, base_rpr, underline=False)
+
+
+def _rebuild_cover_field_paragraph(paragraph: ET.Element, prefix: str, field_text: str, suffix: str) -> None:
+    ppr = paragraph.find("w:pPr", NS)
+    preserved_ppr = copy.deepcopy(ppr) if ppr is not None else None
+    base_rpr = _first_run_properties(paragraph)
+    for child in list(paragraph):
+        paragraph.remove(child)
+    if preserved_ppr is not None:
+        paragraph.append(preserved_ppr)
+    if prefix:
+        _append_cover_run(paragraph, prefix, base_rpr, underline=False)
+    _append_cover_run(paragraph, field_text, base_rpr, underline=False)
+    if suffix:
+        _append_cover_run(paragraph, suffix, base_rpr, underline=False)
+
+
+def _append_cover_run(paragraph: ET.Element, text: str, rpr: ET.Element | None, underline: bool) -> ET.Element:
+    run = ET.SubElement(paragraph, _w("r"))
+    if rpr is not None:
+        run.append(copy.deepcopy(rpr))
+    if underline:
+        _set_run_underline(run)
+    else:
+        _clear_run_underline(run)
+    text_node = ET.SubElement(run, _w("t"))
+    text_node.text = text
+    if re.search(r"^\s|\s$", text) or re.search(r"\s{2,}", text):
+        text_node.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    return run
+
+
+def _cover_field_space_units(text: str) -> int:
     width = 0
     for char in text:
-        width += 2 if "\u4e00" <= char <= "\u9fff" else 1
+        width += COVER_CJK_SPACE_UNITS if _is_cover_wide_char(char) else 1
     return width
+
+
+def _is_cover_wide_char(char: str) -> bool:
+    return "\u2e80" <= char <= "\uffef"
 
 
 def _set_run_underline(run: ET.Element) -> None:
@@ -502,6 +605,14 @@ def _set_run_underline(run: ET.Element) -> None:
         underline = ET.Element(_w("u"))
         rpr.append(underline)
     underline.set(_w("val"), "single")
+
+
+def _clear_run_underline(run: ET.Element) -> None:
+    rpr = run.find("w:rPr", NS)
+    if rpr is None:
+        return
+    for underline in list(rpr.findall("w:u", NS)):
+        rpr.remove(underline)
 
 
 def _cover_field_key(text: str) -> str | None:
@@ -566,11 +677,11 @@ def _normalize_keywords(text: str, english: bool) -> str:
 
 
 def _filled_abstract_elements(slots: TemplateSlots, abstract: AbstractParts) -> list[ET.Element]:
-    elements = [_paragraph_from_template(slots.zh_abstract_heading, "摘  要")]
+    elements = [_paragraph_from_template(slots.zh_abstract_heading, "摘  要", preserve_runs=True)]
     zh_paragraphs = abstract.zh_paragraphs or [""]
     elements.extend(_paragraph_from_template(slots.zh_abstract_body, text) for text in zh_paragraphs if text or len(zh_paragraphs) == 1)
     elements.append(_paragraph_from_template(slots.zh_keywords, abstract.zh_keywords or "关键词："))
-    elements.append(_paragraph_from_template(slots.en_abstract_heading, "ABSTRACT"))
+    elements.append(_paragraph_from_template(slots.en_abstract_heading, "ABSTRACT", preserve_runs=True))
     en_paragraphs = abstract.en_paragraphs or [""]
     elements.extend(_paragraph_from_template(slots.en_abstract_body, text) for text in en_paragraphs if text or len(en_paragraphs) == 1)
     elements.append(_paragraph_from_template(slots.en_keywords, abstract.en_keywords or "Key words: "))
@@ -591,9 +702,11 @@ def _filled_toc_elements(slots: TemplateSlots, titles: list[str]) -> list[ET.Ele
 def _filled_body_elements(slots: TemplateSlots, body: list[ET.Element]) -> list[ET.Element]:
     elements: list[ET.Element] = []
     seen_first_main = False
+    pending_figure_visual = False
     for source in body:
         if source.tag == _w("tbl"):
             elements.append(_sanitize_imported_body_element(source))
+            pending_figure_visual = False
             continue
         if source.tag != _w("p"):
             continue
@@ -601,6 +714,7 @@ def _filled_body_elements(slots: TemplateSlots, body: list[ET.Element]) -> list[
         has_embedded_visual = _has_embedded_visual(source)
         if not text and has_embedded_visual:
             elements.append(_visual_only_paragraph_from_source(source))
+            pending_figure_visual = True
             continue
         if not text:
             continue
@@ -608,31 +722,56 @@ def _filled_body_elements(slots: TemplateSlots, body: list[ET.Element]) -> list[
             template = slots.first_main_heading if not seen_first_main else slots.later_main_heading
             elements.append(_paragraph_from_template(template, _normalize_heading_spacing(text)))
             seen_first_main = True
+            pending_figure_visual = False
         elif re.match(r"^[1-9]\.\d+\.\d+\s*", text):
             elements.append(_paragraph_from_template(slots.third_heading, _normalize_heading_spacing(text)))
+            pending_figure_visual = False
         elif re.match(r"^[1-9]\.\d+\s*", text):
             elements.append(_paragraph_from_template(slots.second_heading, _normalize_heading_spacing(text)))
+            pending_figure_visual = False
         elif _is_caption_text(text):
-            template = slots.table_caption if text.strip().startswith("表") else slots.figure_caption
-            elements.append(_paragraph_from_template(template, _normalize_caption_spacing(text)))
+            if text.strip().startswith("图"):
+                if has_embedded_visual:
+                    elements.append(_visual_only_paragraph_from_source(source))
+                    pending_figure_visual = True
+                elements.append(_paragraph_from_template(slots.figure_caption, _normalize_caption_spacing(text), role="caption"))
+                pending_figure_visual = False
+            else:
+                elements.append(_paragraph_from_template(slots.table_caption, _normalize_caption_spacing(text), role="caption"))
+                pending_figure_visual = False
         else:
-            elements.append(_paragraph_from_template(slots.body_paragraph, text))
-        if has_embedded_visual and not _is_caption_text(text):
-            elements.append(_visual_only_paragraph_from_source(source))
+            elements.append(_paragraph_from_template(slots.body_paragraph, normalize_inline_citations(text)))
+            pending_figure_visual = False
+            if has_embedded_visual:
+                elements.append(_visual_only_paragraph_from_source(source))
+                pending_figure_visual = True
     return elements
 
 
 def _filled_reference_elements(slots: TemplateSlots, references: list[ET.Element]) -> list[ET.Element]:
-    items = [
+    items = _unique_reference_items(
         _paragraph_text(element).strip()
         for element in references
         if element.tag == _w("p") and _paragraph_text(element).strip() and _compact(_paragraph_text(element)) != "参考文献"
-    ]
+    )
     if not items:
         return []
     return [_paragraph_from_template(slots.reference_heading, "参考文献")] + [
-        _paragraph_from_template(slots.reference_item, item) for item in items
+        _paragraph_from_template(slots.reference_item, item, role="reference") for item in items
     ]
+
+
+def _unique_reference_items(raw_items) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        normalized = _normalize_reference_item_text(raw)
+        key = re.sub(r"\s+", " ", normalized).strip().casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(normalized)
+    return items
 
 
 def _filled_acknowledgement_elements(slots: TemplateSlots, acknowledgements: list[ET.Element]) -> list[ET.Element]:
@@ -648,7 +787,34 @@ def _filled_acknowledgement_elements(slots: TemplateSlots, acknowledgements: lis
     ]
 
 
-def _paragraph_from_template(template: ET.Element, text: str) -> ET.Element:
+def _filled_appendix_elements(appendices: list[ET.Element]) -> list[ET.Element]:
+    if not appendices:
+        return []
+    result: list[ET.Element] = [_page_break_paragraph()]
+    for element in appendices:
+        if element.tag == _w("p"):
+            text = _paragraph_text(element).strip()
+            has_visual = _has_embedded_visual(element)
+            if not text and not has_visual:
+                continue
+            copied = copy.deepcopy(element)
+            if re.sub(r"\s+", "", text).startswith(("附录", "附件")):
+                _set_paragraph_text(copied, "附录")
+            result.append(copied)
+        else:
+            result.append(copy.deepcopy(element))
+    return result
+
+
+def _paragraph_from_template(template: ET.Element, text: str, role: str | None = None, preserve_runs: bool = False) -> ET.Element:
+    if preserve_runs:
+        paragraph = copy.deepcopy(template)
+        for name in list(paragraph.attrib):
+            if "rsid" in name or name.endswith("paraId") or name.endswith("textId"):
+                paragraph.attrib.pop(name, None)
+        _replace_visible_text_preserving_runs(paragraph, text)
+        _normalize_generated_paragraph(paragraph, role)
+        return paragraph
     paragraph = ET.Element(_w("p"))
     for name, value in template.attrib.items():
         if "rsid" not in name and not name.endswith("paraId") and not name.endswith("textId"):
@@ -668,7 +834,138 @@ def _paragraph_from_template(template: ET.Element, text: str) -> ET.Element:
     t.text = text
     if re.search(r"^\s|\s$", text) or re.search(r"\s{2,}", text):
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    _normalize_generated_paragraph(paragraph, role)
     return paragraph
+
+
+def _replace_visible_text_preserving_runs(paragraph: ET.Element, text: str) -> None:
+    text_nodes = [node for node in paragraph.findall(".//w:t", NS) if node.text]
+    if not text_nodes:
+        run = ET.SubElement(paragraph, _w("r"))
+        t = ET.SubElement(run, _w("t"))
+        t.text = text
+        _set_space_preserve(t, text)
+        return
+
+    remaining = text
+    original_lengths = [len(node.text or "") for node in text_nodes]
+    for idx, node in enumerate(text_nodes):
+        if idx == len(text_nodes) - 1:
+            value = remaining
+        else:
+            length = original_lengths[idx]
+            value = remaining[:length]
+            remaining = remaining[length:]
+        node.text = value
+        _set_space_preserve(node, value)
+
+
+def _set_space_preserve(text_node: ET.Element, text: str) -> None:
+    space_key = "{http://www.w3.org/XML/1998/namespace}space"
+    if re.search(r"^\s|\s$", text) or re.search(r"\s{2,}", text):
+        text_node.set(space_key, "preserve")
+    else:
+        text_node.attrib.pop(space_key, None)
+
+
+def _normalize_generated_paragraph(paragraph: ET.Element, role: str | None) -> None:
+    if role == "caption":
+        _normalize_generated_caption(paragraph)
+    elif role == "reference":
+        _normalize_generated_reference(paragraph)
+
+
+def _normalize_generated_caption(paragraph: ET.Element) -> None:
+    ppr = _ensure_generated_ppr(paragraph)
+    for name in ("pStyle", "numPr", "ind", "tabs", "pageBreakBefore", "autoSpaceDE", "autoSpaceDN", "adjustRightInd"):
+        _remove_ppr_child(ppr, name)
+    spacing = _ensure_ppr_child(ppr, "spacing")
+    spacing.set(_w("before"), "0")
+    spacing.set(_w("after"), "0")
+    spacing.set(_w("line"), "240")
+    spacing.set(_w("lineRule"), "auto")
+    jc = _ensure_ppr_child(ppr, "jc")
+    jc.set(_w("val"), "center")
+    if _paragraph_text(paragraph).strip().startswith("表"):
+        _ensure_ppr_child(ppr, "keepNext")
+    else:
+        _remove_ppr_child(ppr, "keepNext")
+    _ensure_ppr_child(ppr, "keepLines")
+    for run in paragraph.findall("w:r", NS):
+        _set_generated_run_font(run, east_asia="宋体", ascii_font="Times New Roman", size="18", bold=True)
+
+
+def _normalize_generated_reference(paragraph: ET.Element) -> None:
+    ppr = _ensure_generated_ppr(paragraph)
+    for name in ("pStyle", "numPr", "keepNext", "pageBreakBefore", "autoSpaceDE", "autoSpaceDN", "adjustRightInd", "tabs"):
+        _remove_ppr_child(ppr, name)
+    spacing = _ensure_ppr_child(ppr, "spacing")
+    spacing.set(_w("before"), "0")
+    spacing.set(_w("after"), "0")
+    spacing.set(_w("line"), "300")
+    spacing.set(_w("lineRule"), "auto")
+    ind = _ensure_ppr_child(ppr, "ind")
+    ind.attrib.clear()
+    ind.set(_w("left"), "480")
+    ind.set(_w("hanging"), "480")
+    ind.set(_w("hangingChars"), "200")
+    jc = _ensure_ppr_child(ppr, "jc")
+    jc.set(_w("val"), "left")
+    _ensure_ppr_child(ppr, "keepLines")
+    for run in paragraph.findall("w:r", NS):
+        _set_generated_run_font(run, east_asia="宋体", ascii_font="Times New Roman", size="24", bold=False)
+
+
+def _ensure_generated_ppr(paragraph: ET.Element) -> ET.Element:
+    ppr = paragraph.find("w:pPr", NS)
+    if ppr is None:
+        ppr = ET.Element(_w("pPr"))
+        paragraph.insert(0, ppr)
+    return ppr
+
+
+def _ensure_ppr_child(ppr: ET.Element, name: str) -> ET.Element:
+    child = ppr.find(f"w:{name}", NS)
+    if child is None:
+        child = ET.Element(_w(name))
+        ppr.append(child)
+    return child
+
+
+def _remove_ppr_child(ppr: ET.Element, name: str) -> None:
+    for child in list(ppr.findall(f"w:{name}", NS)):
+        ppr.remove(child)
+
+
+def _set_generated_run_font(run: ET.Element, east_asia: str, ascii_font: str, size: str, bold: bool) -> None:
+    rpr = run.find("w:rPr", NS)
+    if rpr is None:
+        rpr = ET.Element(_w("rPr"))
+        run.insert(0, rpr)
+    for name in ("rStyle", "color", "u", "highlight"):
+        for child in list(rpr.findall(f"w:{name}", NS)):
+            rpr.remove(child)
+    rfonts = rpr.find("w:rFonts", NS)
+    if rfonts is None:
+        rfonts = ET.Element(_w("rFonts"))
+        rpr.insert(0, rfonts)
+    rfonts.set(_w("eastAsia"), east_asia)
+    rfonts.set(_w("ascii"), ascii_font)
+    rfonts.set(_w("hAnsi"), ascii_font)
+    for name in ("sz", "szCs"):
+        node = rpr.find(f"w:{name}", NS)
+        if node is None:
+            node = ET.SubElement(rpr, _w(name))
+        node.set(_w("val"), size)
+    for name in ("b", "bCs"):
+        node = rpr.find(f"w:{name}", NS)
+        if bold:
+            if node is None:
+                ET.SubElement(rpr, _w(name))
+            else:
+                node.attrib.pop(_w("val"), None)
+        elif node is not None:
+            rpr.remove(node)
 
 
 def _set_paragraph_text(paragraph: ET.Element, text: str) -> None:
@@ -806,6 +1103,10 @@ def _normalize_heading_spacing(text: str) -> str:
 
 def _normalize_caption_spacing(text: str) -> str:
     return re.sub(r"^(图|表)\s*([0-9]+)\s*[-－]\s*([0-9]+)\s*", r"\1 \2-\3 ", text.strip())
+
+
+def _normalize_reference_item_text(text: str) -> str:
+    return normalize_reference_text(text)
 
 
 def _toc_level(title: str) -> int:
